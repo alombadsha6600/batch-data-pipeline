@@ -1,7 +1,8 @@
 """Silver layer: Cleaned and deduplicated data in Delta Lake."""
 from datetime import datetime
 from typing import Dict, Any, Optional
-import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 
@@ -46,53 +47,80 @@ class SilverProcessor(BaseProcessor):
         """
         try:
             date_partition = datetime.utcnow().strftime("%Y-%m-%d")
-            
-            # Read from Bronze using DuckDB
             bronze_path = f"s3://{self.bronze_bucket}/{bronze_key}"
-            
+
             with DuckDBClient() as conn:
-                df = conn.execute(f"""
-                    SELECT
-                        CAST(transaction_id AS VARCHAR) AS transaction_id,
-                        CAST(customer_id AS BIGINT) AS customer_id,
-                        product_id,
-                        quantity,
-                        unit_price,
-                        total_amount,
-                        CAST(transaction_timestamp AS TIMESTAMP) as transaction_timestamp,
-                        payment_method,
-                        store_id,
-                        status,
-                        '{date_partition}' as partition_date,
-                        CURRENT_TIMESTAMP as processed_at
-                    FROM read_json_auto('{bronze_path}')
-                """).df()
-            
-            records_read = len(df)
-            self.logger.info(f"✓ Read {records_read} records from Bronze")
-            
-            # Clean the data
-            df_cleaned = self._clean_data(df)
-            records_cleaned = len(df_cleaned)
-            
+                arrow_table = conn.execute(f"""
+                    WITH raw_data AS (
+                        SELECT
+                            CAST(transaction_id AS VARCHAR) AS transaction_id,
+                            CAST(customer_id AS BIGINT) AS customer_id,
+                            CAST(product_id AS BIGINT) AS product_id,
+                            CAST(quantity AS BIGINT) AS quantity,
+                            unit_price,
+                            total_amount,
+                            CAST(transaction_timestamp AS TIMESTAMP) as transaction_timestamp,
+                            payment_method,
+                            CAST(store_id AS BIGINT) AS store_id,
+                            status,
+                            '{date_partition}' as partition_date,
+                            CURRENT_TIMESTAMP as processed_at
+                        FROM read_json_auto('{bronze_path}')
+                    ),
+                    cleaned_data AS (
+                        SELECT *
+                        FROM raw_data
+                        WHERE 
+                            -- Remove nulls in required fields
+                            transaction_id IS NOT NULL
+                            AND customer_id IS NOT NULL
+                            AND product_id IS NOT NULL
+                            AND transaction_timestamp IS NOT NULL
+                            
+                            -- Remove future timestamps
+                            AND transaction_timestamp <= CURRENT_TIMESTAMP
+                            
+                            -- Remove zero/negative quantities
+                            AND quantity > 0
+                            
+                            -- Remove negative amounts
+                            AND total_amount > 0
+                            
+                            -- Remove mismatched totals (0.01 tolerance)
+                            AND ABS(total_amount - (quantity * unit_price)) <= 0.01
+                            
+                            -- Valid payment methods
+                            AND payment_method IN ('credit_card', 'debit_card', 'cash', 'digital_wallet')
+                            
+                            -- Valid statuses
+                            AND status IN ('completed', 'pending', 'cancelled')
+                            
+                            -- Valid product ID range
+                            AND product_id > 0 
+                            AND product_id <= {self.num_products}
+                    )
+                    SELECT * FROM cleaned_data
+                """).arrow()
+
+            records_read = arrow_table.num_rows
+            records_cleaned = records_read
+
             self.logger.info(
                 f"✓ Cleaned data: {records_read} → {records_cleaned} records "
                 f"({records_read - records_cleaned} removed)"
             )
-            
-            # Deduplicate against existing Delta table
+
             silver_path = f"s3://{self.silver_bucket}/sales"
-            df_to_write, duplicates_removed = self._deduplicate(
-                df_cleaned, 
+            arrow_to_write, duplicates_removed = self._deduplicate(
+                arrow_table,
                 silver_path
             )
-            
-            # Write to Delta Lake
+
             records_written = 0
-            if df_to_write is not None and len(df_to_write) > 0:
-                self._write_to_delta(df_to_write, silver_path)
-                records_written = len(df_to_write)
-                
+            if arrow_to_write is not None and arrow_to_write.num_rows > 0:
+                self._write_to_delta(arrow_to_write, silver_path)
+                records_written = arrow_to_write.num_rows
+
                 # Track metrics
                 self._track_metrics(
                     layer='silver',
@@ -113,138 +141,40 @@ class SilverProcessor(BaseProcessor):
             
         except Exception as e:
             self._handle_error(e, "silver_processing")
-    
-    def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Clean and validate data according to business rules.
-        
-        Removes:
-        - Null required fields
-        - Future timestamps
-        - Zero/negative quantities
-        - Negative amounts
-        - Mismatched totals
-        - Invalid payment methods
-        - Invalid statuses
-        - Invalid product IDs
-        """
-        df = df.copy()
-        initial_count = len(df)
 
-        # Use nullable Int64 dtype for consistent schema
-        df['customer_id'] = df['customer_id'].astype('Int64')
-        df['product_id'] = df['product_id'].astype('Int64')
-        df['quantity'] = df['quantity'].astype('Int64')
-        df['store_id'] = df['store_id'].astype('Int64')
-
-        # Remove nulls in required fields
-        df = df.dropna(subset=[
-            'transaction_id', 
-            'customer_id', 
-            'product_id',
-            'transaction_timestamp'
-        ])
-        self.logger.debug(
-            f"Removed {initial_count - len(df)} records with null required fields"
-        )
-        
-        # Remove future timestamps
-        now = pd.Timestamp.utcnow().tz_localize(None)
-        before_clean = len(df)
-        df['transaction_timestamp'] = pd.to_datetime(
-            df['transaction_timestamp'], 
-            utc=False
-        )
-        df = df[df['transaction_timestamp'] <= now]
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with future timestamps"
-        )
-        
-        # Remove zero or negative quantities
-        before_clean = len(df)
-        df = df[df['quantity'] > 0]
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with non-positive quantities"
-        )
-        
-        # Remove negative amounts
-        before_clean = len(df)
-        df = df[df['total_amount'] > 0]
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with negative amounts"
-        )
-        
-        # Remove mismatched totals (0.01 tolerance for rounding)
-        before_clean = len(df)
-        df['amount_mismatch'] = abs(
-            df['total_amount'] - (df['quantity'] * df['unit_price'])
-        )
-        df = df[df['amount_mismatch'] <= 0.01]
-        df = df.drop('amount_mismatch', axis=1)
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with mismatched totals"
-        )
-        
-        # Keep only valid payment methods
-        valid_methods = ['credit_card', 'debit_card', 'cash', 'digital_wallet']
-        before_clean = len(df)
-        df = df[df['payment_method'].isin(valid_methods)]
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with invalid payment methods"
-        )
-        
-        # Keep only valid statuses
-        valid_statuses = ['completed', 'pending', 'cancelled']
-        before_clean = len(df)
-        df = df[df['status'].isin(valid_statuses)]
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with invalid statuses"
-        )
-        
-        # Filter to valid product ID range
-        before_clean = len(df)
-        df = df[(df['product_id'] > 0) & (df['product_id'] <= self.num_products)]
-        self.logger.debug(
-            f"Removed {before_clean - len(df)} records with invalid product IDs"
-        )
-        
-        self.logger.info(
-            f"Data cleaning complete: {initial_count} → {len(df)} records "
-            f"({initial_count - len(df)} removed)"
-        )
-        
-        return df
-    
     def _deduplicate(
-        self, 
-        df: pd.DataFrame, 
+        self,
+        arrow_table: pa.Table,
         silver_path: str
-    ) -> tuple[Optional[pd.DataFrame], int]:
+    ) -> tuple[Optional[pa.Table], int]:
         """
         Deduplicate records against existing Delta table using partition pruning.
 
         Returns:
-            (df_new, duplicates_removed)
+            (arrow_new, duplicates_removed)
         """
         try:
             dt = DeltaTable(silver_path, storage_options=self.storage_options)
 
             today = datetime.utcnow().strftime("%Y-%m-%d")
 
-            existing_df = dt.to_pandas(
+            existing_table = dt.to_pyarrow_table(
                 filters=[("partition_date", "=", today)]
             )
 
-            existing_ids = set(existing_df['transaction_id'].astype(str).values)
+            existing_ids = existing_table.column('transaction_id').to_pylist()
+            existing_ids_set = set(existing_ids)
 
             self.logger.info(
-                f"Existing table (today's partition): {len(existing_df)} rows, "
-                f"{len(existing_ids)} unique transaction_ids"
+                f"Existing table (today's partition): {existing_table.num_rows} rows, "
+                f"{len(existing_ids_set)} unique transaction_ids"
             )
 
-            df_new = df[~df['transaction_id'].astype(str).isin(existing_ids)]
+            new_ids = arrow_table.column('transaction_id')
+            mask = pc.invert(pc.is_in(new_ids, value_set=pa.array(list(existing_ids_set))))
+            arrow_new = arrow_table.filter(mask)
 
-            duplicates_removed = len(df) - len(df_new)
+            duplicates_removed = arrow_table.num_rows - arrow_new.num_rows
 
             if duplicates_removed > 0:
                 self.logger.warning(
@@ -253,14 +183,14 @@ class SilverProcessor(BaseProcessor):
                 )
 
             self.logger.info(
-                f"After deduplication: {len(df_new)} new records to write"
+                f"After deduplication: {arrow_new.num_rows} new records to write"
             )
 
-            return df_new, duplicates_removed
+            return arrow_new, duplicates_removed
 
         except TableNotFoundError:
             self.logger.info("Delta table does not exist yet (first run)")
-            return df, 0
+            return arrow_table, 0
 
         except Exception as e:
             self.logger.error(
@@ -269,14 +199,13 @@ class SilverProcessor(BaseProcessor):
             )
             raise
     
-    def _write_to_delta(self, df: pd.DataFrame, silver_path: str) -> None:
+    def _write_to_delta(self, arrow_table: pa.Table, silver_path: str) -> None:  # ✅ CHANGED: Accept Arrow
         """
-        Write DataFrame to Delta Lake using APPEND mode.
+        Write Arrow Table to Delta Lake using APPEND mode.
         Idempotent - safe to re-run.
         """
         try:
-            df = df.reset_index(drop=True)
-            
+
             # Check if table exists
             table_exists = False
             try:
@@ -289,20 +218,20 @@ class SilverProcessor(BaseProcessor):
                     f"Error checking table existence: {type(e).__name__}: {e}"
                 )
                 raise
-            
+
             mode = "append" if table_exists else "overwrite"
-            
+
             write_deltalake(
                 silver_path,
-                df,
+                arrow_table,
                 mode=mode,
                 partition_by=["partition_date"],
                 storage_options=self.storage_options,
             )
-            
+
             action = "Appended" if table_exists else "Created"
             self.logger.info(
-                f"✓ {action} {len(df)} records to Silver Delta table"
+                f"✓ {action} {arrow_table.num_rows} records to Silver Delta table"
             )
             
         except FileNotFoundError as e:

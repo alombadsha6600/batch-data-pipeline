@@ -2,7 +2,8 @@
 from datetime import datetime
 from typing import Dict, Any, List, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 
@@ -86,7 +87,7 @@ class GoldProcessor(BaseProcessor):
         except Exception as e:
             self._handle_error(e, "gold_aggregation")
     
-    def _load_silver_data(self, date: str = None) -> Optional[pd.DataFrame]:
+    def _load_silver_data(self, date: str = None) -> Optional[pa.Table]:
         """Load only today's partition for incremental aggregation."""
         silver_path = f"s3://{self.silver_bucket}/sales"
         
@@ -96,14 +97,14 @@ class GoldProcessor(BaseProcessor):
         try:
             dt = DeltaTable(silver_path, storage_options=self.storage_options)
             
-            sales_df = dt.to_pandas(
+            sales_arrow = dt.to_pyarrow_table(
                 filters=[("partition_date", "=", date)]
             )
             
             self.logger.info(
-                f"Loaded {len(sales_df)} records for partition_date={date}"
+                f"Loaded {sales_arrow.num_rows} records for partition_date={date}"
             )
-            return sales_df
+            return sales_arrow
             
         except TableNotFoundError:
             self.logger.warning("Silver table does not exist yet")
@@ -161,16 +162,15 @@ class GoldProcessor(BaseProcessor):
     
     def _aggregate_daily_sales(
         self, 
-        sales_df: pd.DataFrame, 
+        sales_arrow: pa.Table,
         date: str
     ) -> Dict[str, Any]:
-        """Calculate and write daily sales summary."""
         try:
             with DuckDBClient() as conn:
-                conn.register('sales', sales_df)
+                conn.register('sales', sales_arrow)
                 
-                df = conn.execute(f"""
-                    SELECT
+                result_arrow = conn.execute(f"""
+                    SELECT 
                         partition_date,
                         COUNT(DISTINCT transaction_id) as total_transactions,
                         COUNT(DISTINCT customer_id) as unique_customers,
@@ -180,27 +180,26 @@ class GoldProcessor(BaseProcessor):
                         COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_transactions,
                         COUNT(CASE WHEN status = 'cancelled' THEN 1 END) as cancelled_transactions,
                         ROUND(100.0 * COUNT(CASE WHEN status = 'completed' THEN 1 END) /
-                              NULLIF(COUNT(*), 0), 2) as completion_rate
+                            NULLIF(COUNT(*), 0), 2) as completion_rate,
+                        CURRENT_TIMESTAMP as created_at,
+                        '{date}' as data_date
                     FROM sales
                     WHERE partition_date = '{date}'
                     GROUP BY partition_date
-                """).df()
+                """).arrow()
             
-            if len(df) == 0:
+            if result_arrow.num_rows == 0:
                 self.logger.warning("No data for daily_sales_summary")
                 return {"status": "skipped", "rows": 0}
             
-            df['created_at'] = datetime.utcnow()
-            df['data_date'] = date
-            
             self._upsert_to_delta(
                 table_name='daily_sales_summary',
-                df=df,
+                arrow_table=result_arrow,
                 merge_keys=['data_date'],
                 partition_by=['partition_date']
             )
             
-            return {"status": "success", "rows": len(df)}
+            return {"status": "success", "rows": result_arrow.num_rows}
             
         except Exception as e:
             self.logger.error(f"Failed daily_sales_summary: {e}")
@@ -208,7 +207,7 @@ class GoldProcessor(BaseProcessor):
     
     def _aggregate_product_performance(
         self, 
-        sales_df: pd.DataFrame, 
+        sales_arrow: pa.Table,
         date: str
     ) -> Dict[str, Any]:
         """Calculate and write product performance."""
@@ -216,9 +215,9 @@ class GoldProcessor(BaseProcessor):
             products_path = f"s3://{self.bronze_bucket}/dimensions/products.json"
             
             with DuckDBClient() as conn:
-                conn.register('sales', sales_df)
-                
-                df = conn.execute(f"""
+                conn.register('sales', sales_arrow)
+
+                result_arrow = conn.execute(f"""
                     SELECT
                         p.product_id,
                         p.product_name,
@@ -229,7 +228,8 @@ class GoldProcessor(BaseProcessor):
                         AVG(s.unit_price) as avg_selling_price,
                         MIN(s.unit_price) as min_price,
                         MAX(s.unit_price) as max_price,
-                        '{date}' as data_date
+                        '{date}' as data_date,
+                        CURRENT_TIMESTAMP as created_at
                     FROM sales s
                     JOIN read_json_auto('{products_path}') p
                         ON s.product_id = p.product_id
@@ -237,30 +237,28 @@ class GoldProcessor(BaseProcessor):
                         AND s.status = 'completed'
                     GROUP BY p.product_id, p.product_name, p.category
                     ORDER BY revenue DESC
-                """).df()
+                """).arrow()
             
-            if len(df) == 0:
+            if result_arrow.num_rows == 0:
                 self.logger.warning("No data for product_performance")
                 return {"status": "skipped", "rows": 0}
             
-            df['created_at'] = datetime.utcnow()
-            
             self._upsert_to_delta(
                 table_name='product_performance',
-                df=df,
+                arrow_table=result_arrow,
                 merge_keys=['product_id', 'data_date'],
                 partition_by=['data_date']
             )
             
-            return {"status": "success", "rows": len(df)}
+            return {"status": "success", "rows": result_arrow.num_rows}
             
         except Exception as e:
             self.logger.error(f"Failed product_performance: {e}")
             raise
-    
+
     def _aggregate_customer_segments(
         self, 
-        sales_df: pd.DataFrame, 
+        sales_arrow: pa.Table,
         date: str
     ) -> Dict[str, Any]:
         """Calculate and write customer segmentation."""
@@ -268,9 +266,9 @@ class GoldProcessor(BaseProcessor):
             customers_path = f"s3://{self.bronze_bucket}/dimensions/customers.json"
             
             with DuckDBClient() as conn:
-                conn.register('sales', sales_df)
+                conn.register('sales', sales_arrow)
                 
-                df = conn.execute(f"""
+                result_arrow = conn.execute(f"""
                     SELECT
                         c.customer_id,
                         c.customer_name,
@@ -287,7 +285,8 @@ class GoldProcessor(BaseProcessor):
                             WHEN SUM(s.total_amount) > 1000 THEN 'High Value'
                             WHEN SUM(s.total_amount) > 500 THEN 'Medium Value'
                             ELSE 'Low Value'
-                        END as value_tier
+                        END as value_tier,
+                        CURRENT_TIMESTAMP as created_at
                     FROM sales s
                     JOIN read_json_auto('{customers_path}') c
                         ON s.customer_id = c.customer_id
@@ -295,22 +294,20 @@ class GoldProcessor(BaseProcessor):
                         AND s.status = 'completed'
                     GROUP BY c.customer_id, c.customer_name, c.customer_segment, c.city, c.country
                     ORDER BY total_spend DESC
-                """).df()
+                """).arrow()
             
-            if len(df) == 0:
+            if result_arrow.num_rows == 0:
                 self.logger.warning("No data for customer_segments")
                 return {"status": "skipped", "rows": 0}
             
-            df['created_at'] = datetime.utcnow()
-            
             self._upsert_to_delta(
                 table_name='customer_segments',
-                df=df,
+                arrow_table=result_arrow,
                 merge_keys=['customer_id', 'data_date'],
                 partition_by=['data_date']
             )
             
-            return {"status": "success", "rows": len(df)}
+            return {"status": "success", "rows": result_arrow.num_rows}
             
         except Exception as e:
             self.logger.error(f"Failed customer_segments: {e}")
@@ -319,7 +316,7 @@ class GoldProcessor(BaseProcessor):
     def _upsert_to_delta(
         self,
         table_name: str,
-        df: pd.DataFrame,
+        arrow_table: pa.Table,
         merge_keys: List[str],
         partition_by: Optional[List[str]] = None
     ) -> None:
@@ -329,12 +326,11 @@ class GoldProcessor(BaseProcessor):
         
         Args:
             table_name: Name of the Delta table
-            df: DataFrame to upsert
+            arrow_table: Arrow table to upsert
             merge_keys: List of columns for merge condition
             partition_by: Columns to partition by
         """
         table_path = f"s3://{self.gold_bucket}/{table_name}"
-        df = df.reset_index(drop=True)
         
         try:
             dt = DeltaTable(table_path, storage_options=self.storage_options)
@@ -357,7 +353,7 @@ class GoldProcessor(BaseProcessor):
             try:
                 (
                     dt.merge(
-                        source=df,
+                        source=arrow_table,
                         predicate=merge_condition,
                         source_alias="source",
                         target_alias="target"
@@ -368,7 +364,7 @@ class GoldProcessor(BaseProcessor):
                 )
                 
                 self.logger.info(
-                    f"✓ Merged {len(df)} rows into {table_name} (idempotent)"
+                    f"✓ Merged {arrow_table.num_rows} rows into {table_name} (idempotent)"
                 )
                 
             except Exception as e:
@@ -380,13 +376,13 @@ class GoldProcessor(BaseProcessor):
             try:
                 write_deltalake(
                     table_path,
-                    df,
+                    arrow_table,
                     mode='overwrite',
                     partition_by=partition_by,
                     storage_options=self.storage_options,
                 )
                 self.logger.info(
-                    f"✓ Created {table_name} Delta table ({len(df)} rows)"
+                    f"✓ Created {table_name} Delta table ({arrow_table.num_rows} rows)"
                 )
             except Exception as e:
                 self.logger.error(
